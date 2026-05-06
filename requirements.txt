@@ -1,1 +1,8 @@
+fastapi
+uvicorn[standard]
+pydantic[email]
+pyjwt
+bcrypt
+psycopg2-binary
+httpx
 
