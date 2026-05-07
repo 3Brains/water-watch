@@ -35,7 +35,7 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@earthwatch.app")
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-VERSION = "0.1.11"
+VERSION = "0.1.12"
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
@@ -412,10 +412,27 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
 
 @app.api_route("/health", methods=["GET", "HEAD"])
 async def health_check():
+    # v0.1.12: include diagnostic counts so anyone can paste /health in a
+    # browser and see if the buoy pipe is wired. Wrapped in try/except so a
+    # DB hiccup never breaks the health check itself.
+    diag = {}
+    try:
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute("SELECT COUNT(*) FROM ocean_sites WHERE source = 'ndbc' AND active = TRUE")
+            diag["ocean_sites_ndbc"] = c.fetchone()[0]
+            c.execute("SELECT COUNT(*) FROM buoy_readings")
+            diag["buoy_readings_total"] = c.fetchone()[0]
+            c.execute("SELECT MAX(fetched_at) FROM buoy_readings")
+            row = c.fetchone()
+            diag["last_buoy_write"] = str(row[0]) if row and row[0] else None
+    except Exception as e:
+        diag["diag_error"] = str(e)[:200]
     return {
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
-        "version": VERSION
+        "version": VERSION,
+        **diag
     }
 
 
@@ -831,7 +848,7 @@ class GeocodeQuery(BaseModel):
 
 @app.post("/ew/geocode")
 async def geocode_place(q: GeocodeQuery, user_id: int = Depends(get_current_user)):
-    """Forward geocode a free-text query (city, address, landmark) via Google.
+    """Forward-geocode a free-text query via Google Places API findplacefromtext.
     Returns up to 5 candidates so the user can pick the right match.
     Backend-side so the API key never lives in the frontend."""
     if not GOOGLE_GEOCODING_API_KEY:
@@ -839,13 +856,11 @@ async def geocode_place(q: GeocodeQuery, user_id: int = Depends(get_current_user
     text = (q.query or "").strip()
     if len(text) < 2:
         raise HTTPException(status_code=400, detail="Query too short")
-    # v0.1.11: bounds bias + region + "Hawaii" prepend, replacing the v0.1.9
-    # strict components filter that broke informal place names. components=
-    # administrative_area:HI excluded "Pipeline", "Sunset Beach", and other
-    # surf-spot nicknames that Google does not tag with administrative_area,
-    # falling back to the state centroid on Big Island. Bounds is a bias hint
-    # (not exclusion); the "Hawaii" suffix gives Google a context signal that
-    # disambiguates "Turtle Bay Hawaii" -> Oahu (not Manhattan).
+    # v0.1.12: switched from Geocoding API to Places API findplacefromtext.
+    # Geocoding API is built for structured addresses; Places API is built for
+    # fuzzy informal-name matching. "Pipeline" -> Banzai Pipeline, "Sunset" ->
+    # Sunset Beach. locationbias=rectangle pulls Hawaii results to the top.
+    # Fixes the Pipeline/Sunset/Turtle-Bay-as-Hawaii-centroid failure mode.
     coord_parts = [p.strip() for p in text.split(",")]
     is_coord = False
     if len(coord_parts) == 2:
@@ -854,39 +869,72 @@ async def geocode_place(q: GeocodeQuery, user_id: int = Depends(get_current_user
             is_coord = True
         except (ValueError, TypeError):
             pass
-    text_lower = text.lower()
-    already_hawaii = ("hawaii" in text_lower
-                      or ", hi" in text_lower
-                      or text_lower.endswith(" hi"))
-    search_text = text if (is_coord or already_hawaii) else (text + " Hawaii")
+    # Coords skip Places API entirely - Places doesn't take raw lat/lng input.
+    # Fall back to Geocoding API for coord parsing (it handles "21.3,-157.8").
+    if is_coord:
+        try:
+            url = ("https://maps.googleapis.com/maps/api/geocode/json?address="
+                   + urllib.parse.quote(text)
+                   + "&key=" + GOOGLE_GEOCODING_API_KEY)
+            req = urllib.request.Request(url, headers={"User-Agent": "EarthWatch/0.1"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json_lib.loads(resp.read().decode("utf-8", errors="replace"))
+        except Exception as e:
+            print("[geocode coord] " + str(e))
+            raise HTTPException(status_code=502, detail="Geocoding lookup failed")
+        status = data.get("status")
+        if status == "ZERO_RESULTS":
+            return {"candidates": []}
+        if status != "OK":
+            print("[geocode coord] status=" + str(status))
+            raise HTTPException(status_code=502, detail="Geocoding lookup failed")
+        out = []
+        for r in (data.get("results") or [])[:5]:
+            loc = ((r.get("geometry") or {}).get("location")) or {}
+            if loc.get("lat") is None or loc.get("lng") is None:
+                continue
+            out.append({
+                "formatted_address": r.get("formatted_address", ""),
+                "lat": float(loc.get("lat")),
+                "lng": float(loc.get("lng")),
+                "place_id": r.get("place_id", ""),
+            })
+        return {"candidates": out}
+    # Free-text query: Places API findplacefromtext with Hawaii location bias.
     try:
-        url = ("https://maps.googleapis.com/maps/api/geocode/json?address="
-               + urllib.parse.quote(search_text)
-               + "&bounds=" + urllib.parse.quote("18.85,-160.50|22.30,-154.75")
-               + "&region=us"
+        url = ("https://maps.googleapis.com/maps/api/place/findplacefromtext/json"
+               "?input=" + urllib.parse.quote(text)
+               + "&inputtype=textquery"
+               + "&locationbias=" + urllib.parse.quote("rectangle:18.85,-160.50|22.30,-154.75")
+               + "&fields=" + urllib.parse.quote("formatted_address,geometry,name,place_id")
                + "&key=" + GOOGLE_GEOCODING_API_KEY)
         req = urllib.request.Request(url, headers={"User-Agent": "EarthWatch/0.1"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json_lib.loads(resp.read().decode("utf-8", errors="replace"))
     except Exception as e:
-        print("[geocode] " + str(e))
+        print("[geocode places] " + str(e))
         raise HTTPException(status_code=502, detail="Geocoding lookup failed")
     status = data.get("status")
     if status == "ZERO_RESULTS":
         return {"candidates": []}
     if status != "OK":
-        # Don't leak Google error_message to client — just say it failed.
-        print("[geocode] Google returned status=" + str(status) + " for query: " + text)
+        print("[geocode places] status=" + str(status) + " for query: " + text
+              + " (error_message=" + str(data.get("error_message", ""))[:200] + ")")
         raise HTTPException(status_code=502, detail="Geocoding lookup failed")
     candidates = []
-    for r in (data.get("results") or [])[:5]:
+    for r in (data.get("candidates") or [])[:5]:
         loc = ((r.get("geometry") or {}).get("location")) or {}
         lat = loc.get("lat")
         lng = loc.get("lng")
         if lat is None or lng is None:
             continue
+        # Places API gives us a richer "name" field separate from formatted_address.
+        # Format as "Name, Address" so users see the place name first.
+        name = r.get("name", "")
+        addr = r.get("formatted_address", "")
+        display = (name + ", " + addr) if (name and addr and name.lower() not in addr.lower()) else (name or addr)
         candidates.append({
-            "formatted_address": r.get("formatted_address", ""),
+            "formatted_address": display,
             "lat": float(lat),
             "lng": float(lng),
             "place_id": r.get("place_id", ""),
@@ -1204,7 +1252,11 @@ class Sources:
                 with urllib.request.urlopen(req, timeout=15) as resp:
                     text = resp.read().decode("utf-8", errors="replace")
             except Exception as e:
-                # Most common: 404 for far-field DART buoys. Skip silently.
+                # v0.1.12: log per-station fetch failures so we can tell whether
+                # readings_written=0 is "all stations 404" vs "parse failure"
+                # vs "DB write failure". Prior version silently swallowed.
+                err = str(e)[:120]
+                print("[Sources.fetch_ndbc] fetch " + str(station_id) + ": " + err)
                 continue
 
             lines = [ln for ln in text.splitlines() if ln.strip() and not ln.startswith("#")]
