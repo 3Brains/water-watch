@@ -35,7 +35,7 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@earthwatch.app")
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-VERSION = "0.1.8"
+VERSION = "0.1.9"
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
@@ -711,6 +711,49 @@ async def get_place_events(place_id: int, user_id: int = Depends(get_current_use
 
         static_map_url = build_static_map_url(place_lat, place_lng, place_radius, ev_pins)
 
+        # v0.1.9: nearby buoy readings (NDBC). Latest reading per ocean_site
+        # within the place radius. Same spatial-join model as events, but
+        # against ocean_sites/buoy_readings rather than ew_events. Empty list
+        # if no NDBC stations are within range.
+        c.execute("""
+            SELECT s.id, s.source_id, s.name, s.lat, s.lng,
+                   ST_Distance(s.geom, p.geom) / 1609.344 AS distance_mi,
+                   r.recorded_at, r.wave_height_ft, r.wave_period_sec,
+                   r.wave_direction_deg, r.sea_temp_c, r.air_temp_c,
+                   r.wind_speed_mps, r.wind_direction_deg
+            FROM ocean_sites s
+            JOIN ew_places p ON p.id = %s
+            LEFT JOIN LATERAL (
+                SELECT * FROM buoy_readings
+                WHERE ocean_site_id = s.id
+                ORDER BY recorded_at DESC LIMIT 1
+            ) r ON TRUE
+            WHERE s.source = 'ndbc'
+              AND s.active = TRUE
+              AND ST_DWithin(s.geom, p.geom, p.radius_mi * 1609.344)
+            ORDER BY distance_mi ASC
+            LIMIT 10
+        """, (place_id,))
+
+        buoys = []
+        for row in c.fetchall():
+            buoys.append({
+                "site_id": row[0],
+                "station_id": row[1],
+                "name": row[2],
+                "lat": float(row[3]) if row[3] is not None else None,
+                "lng": float(row[4]) if row[4] is not None else None,
+                "distance_mi": round(float(row[5]), 1) if row[5] is not None else None,
+                "recorded_at": str(row[6]) if row[6] else None,
+                "wave_height_ft": float(row[7]) if row[7] is not None else None,
+                "wave_period_sec": float(row[8]) if row[8] is not None else None,
+                "wave_direction_deg": float(row[9]) if row[9] is not None else None,
+                "sea_temp_c": float(row[10]) if row[10] is not None else None,
+                "air_temp_c": float(row[11]) if row[11] is not None else None,
+                "wind_speed_mps": float(row[12]) if row[12] is not None else None,
+                "wind_direction_deg": float(row[13]) if row[13] is not None else None,
+            })
+
         return {
             "place": {
                 "id": place[0],
@@ -724,6 +767,7 @@ async def get_place_events(place_id: int, user_id: int = Depends(get_current_use
             "events": events,
             "count": len(events),
             "static_map_url": static_map_url,
+            "buoys": buoys,
         }
 
 
@@ -796,8 +840,12 @@ async def geocode_place(q: GeocodeQuery, user_id: int = Depends(get_current_user
     if len(text) < 2:
         raise HTTPException(status_code=400, detail="Query too short")
     try:
+        # v0.1.9: components=administrative_area:HI|country:US is Google's STRICT
+        # filter (not a bias hint) - any result outside Hawaii is excluded entirely.
+        # Fixes Turtle Bay -> Manhattan and similar globally-ambiguous beach names.
         url = ("https://maps.googleapis.com/maps/api/geocode/json?address="
                + urllib.parse.quote(text)
+               + "&components=" + urllib.parse.quote("administrative_area:HI|country:US")
                + "&key=" + GOOGLE_GEOCODING_API_KEY)
         req = urllib.request.Request(url, headers={"User-Agent": "EarthWatch/0.1"})
         with urllib.request.urlopen(req, timeout=10) as resp:
@@ -1106,6 +1154,98 @@ class Sources:
                 continue
         return out
 
+    @staticmethod
+    def fetch_ndbc() -> int:
+        """Fetch latest NDBC buoy readings for every Hawaii buoy in ocean_sites
+        (source='ndbc'). Writes to buoy_readings table directly - this is a
+        sensor stream, not an event source. Returns count of readings written.
+
+        NDBC realtime2/{station}.txt is space-delimited with a 2-line header.
+        Format: YY MM DD hh mm WDIR WSPD GST WVHT DPD APD MWD PRES ATMP WTMP DEWP VIS PTDY TIDE
+        Missing values are 'MM'. We take only the most recent (first data) row.
+
+        v0.1.9: just stream readings into the DB. Threshold-based event firing
+        (high_surf when WVHT crosses a tier-specific limit) is v0.2."""
+        import re as re_lib
+        written = 0
+        try:
+            with get_db() as conn:
+                c = conn.cursor()
+                c.execute("SELECT id, source_id FROM ocean_sites WHERE source = 'ndbc' AND active = TRUE")
+                stations = c.fetchall()
+        except Exception as e:
+            print("[Sources.fetch_ndbc] ocean_sites query failed: " + str(e))
+            return 0
+
+        for site_id, station_id in stations:
+            try:
+                url = "https://www.ndbc.noaa.gov/data/realtime2/" + str(station_id) + ".txt"
+                req = urllib.request.Request(
+                    url, headers={"User-Agent": Sources.BROWSER_UA, "Accept": "text/plain"}
+                )
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    text = resp.read().decode("utf-8", errors="replace")
+            except Exception as e:
+                # Most common: 404 for far-field DART buoys. Skip silently.
+                continue
+
+            lines = [ln for ln in text.splitlines() if ln.strip() and not ln.startswith("#")]
+            if not lines:
+                continue
+            # Take the most recent (first) data row.
+            cols = re_lib.split(r"\s+", lines[0].strip())
+            if len(cols) < 15:
+                continue
+
+            def f(s):
+                if s is None or s == "MM" or s == "":
+                    return None
+                try:
+                    return float(s)
+                except (ValueError, TypeError):
+                    return None
+
+            try:
+                yy, mm, dd, hh, minute = (int(cols[0]), int(cols[1]), int(cols[2]),
+                                          int(cols[3]), int(cols[4]))
+                # NDBC reports UTC. Two-digit year is post-2000.
+                if yy < 100:
+                    yy += 2000
+                recorded_at = datetime(yy, mm, dd, hh, minute)
+            except Exception:
+                continue
+
+            wdir_deg     = f(cols[5])
+            wspd_mps     = f(cols[6])
+            wvht_m       = f(cols[8])
+            dpd_sec      = f(cols[9])
+            mwd_deg      = f(cols[11])
+            atmp_c       = f(cols[13])
+            wtmp_c       = f(cols[14])
+
+            wave_height_ft = (wvht_m * 3.28084) if wvht_m is not None else None
+
+            try:
+                with get_db() as conn:
+                    cw = conn.cursor()
+                    cw.execute("""
+                        INSERT INTO buoy_readings (
+                            ocean_site_id, recorded_at,
+                            wave_height_ft, wave_period_sec, wave_direction_deg,
+                            sea_temp_c, air_temp_c, wind_speed_mps, wind_direction_deg
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (ocean_site_id, recorded_at) DO NOTHING
+                    """, (site_id, recorded_at, wave_height_ft, dpd_sec, mwd_deg,
+                          wtmp_c, atmp_c, wspd_mps, wdir_deg))
+                    conn.commit()
+                    if cw.rowcount > 0:
+                        written += 1
+            except Exception as e:
+                print("[Sources.fetch_ndbc] write " + str(station_id) + ": " + str(e))
+                continue
+
+        return written
+
     # Hawaii island bounding boxes used as event polygon geometries when DOH
     # advisories don't carry coordinates. These are deliberately generous so
     # they cover the entire shoreline of each island. Bigger isn't worse here:
@@ -1371,6 +1511,15 @@ def run_check_cycle():
                       + " new=" + str(len(new_ids)) + " alerts=" + str(fired))
         except Exception as e:
             print("[cron] source " + source + " failed: " + str(e))
+
+    # v0.1.9: NDBC buoy stream. Separate path - writes to buoy_readings (sensor
+    # stream), not ew_events. Threshold-based event firing is v0.2.
+    try:
+        ndbc_written = Sources.fetch_ndbc()
+        print("[cron] ndbc: readings_written=" + str(ndbc_written))
+    except Exception as e:
+        print("[cron] source ndbc failed: " + str(e))
+
     print("[cron] EW check cycle complete. new_events=" + str(total_new) + " alerts_fired=" + str(total_alerts))
 
 
