@@ -12,6 +12,8 @@ import os
 import threading
 import time
 import re
+import csv
+import hashlib
 import html as html_lib
 import httpx
 import urllib.request
@@ -33,7 +35,7 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@earthwatch.app")
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-VERSION = "0.1.7"
+VERSION = "0.1.8"
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
@@ -1064,9 +1066,177 @@ class Sources:
         # equivalent), parse alert level (Green/Orange/Red) → severity.
         return []
 
+    # ── Hawaii DOH Clean Water Branch advisories (water quality) ──────────────
+    # Source: eha-cloud.doh.hawaii.gov public events feed (CSV).
+    # Pulls Brown Water Advisory + Beach Advisory types, filters to currently
+    # active (Status != 'Closed'). DOH advisories don't carry lat/lng -- only
+    # an Island name and a free-text Location Name -- so geometry is the per-
+    # island bounding-box polygon. Coarse but always-correct: a watcher on any
+    # Oahu beach sees the Oahu Brown Water Advisory. Per-beach point geometry
+    # via fuzzy-match against ocean_sites.name is a refinement for v0.1.9.
+    @staticmethod
+    def fetch_doh() -> List[dict]:
+        types = [
+            ("Brown Water Advisory", "brown_water"),
+            ("Beach Advisory", "beach_advisory"),
+        ]
+        out = []
+        for type_name, hazard_type in types:
+            url = ("https://eha-cloud.doh.hawaii.gov/cwb/api/events"
+                   "?format=csv&type=" + urllib.parse.quote(type_name))
+            try:
+                req = urllib.request.Request(
+                    url,
+                    headers={"User-Agent": Sources.BROWSER_UA, "Accept": "text/csv"},
+                )
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    csv_text = resp.read().decode("utf-8", errors="replace")
+            except Exception as e:
+                print("[Sources.fetch_doh] " + type_name + ": " + str(e))
+                continue
+
+            try:
+                reader = csv.DictReader(csv_text.splitlines())
+                for row in reader:
+                    ev = Sources._doh_row_to_event(row, type_name, hazard_type)
+                    if ev is not None:
+                        out.append(ev)
+            except Exception as e:
+                print("[Sources.fetch_doh] CSV parse for " + type_name + ": " + str(e))
+                continue
+        return out
+
+    # Hawaii island bounding boxes used as event polygon geometries when DOH
+    # advisories don't carry coordinates. These are deliberately generous so
+    # they cover the entire shoreline of each island. Bigger isn't worse here:
+    # an islandwide brown water advisory really does affect the whole island.
+    HAWAII_ISLAND_BBOX = {
+        "oahu":       ((-158.30, 21.20), (-157.60, 21.80)),
+        "maui":       ((-156.70, 20.55), (-155.95, 21.05)),
+        "molokai":    ((-157.35, 21.05), (-156.70, 21.25)),
+        "lanai":      ((-157.10, 20.70), (-156.78, 20.93)),
+        "kauai":      ((-159.80, 21.85), (-159.28, 22.25)),
+        "hawaii":     ((-156.10, 18.90), (-154.80, 20.30)),
+        "big island": ((-156.10, 18.90), (-154.80, 20.30)),
+    }
+    HAWAII_STATEWIDE_BBOX = ((-159.80, 18.90), (-154.80, 22.25))
+
+    @staticmethod
+    def _doh_row_to_event(row, type_name, hazard_type) -> Optional[dict]:
+        """Convert one DOH CSV row to a normalized event dict, or None to skip."""
+        status = (row.get("Status") or "").strip()
+        if status.lower() == "closed":
+            return None  # historical; we only fire on currently-active advisories
+        title = (row.get("Title") or "").strip()
+        if not title:
+            return None
+
+        # DOH date format: "8/6/2014 2:00:00 PM"
+        issuance_str = (row.get("Issuance Date") or "").strip()
+        occurred_at = None
+        if issuance_str:
+            try:
+                occurred_at = datetime.strptime(issuance_str, "%m/%d/%Y %I:%M:%S %p")
+            except (ValueError, TypeError):
+                occurred_at = None
+
+        island_field = (row.get("Island") or "").strip()
+        statewide = (row.get("Statewide") or "").strip().lower() == "yes"
+        geom_wkt = Sources._hawaii_polygon_for(island_field, statewide)
+        if not geom_wkt:
+            return None
+
+        # Severity ladder: statewide > islandwide > specific location.
+        island_wide = (row.get("Island Wide") or "").strip().lower() == "yes"
+        if statewide:
+            severity = "extreme"
+        elif island_wide:
+            severity = "severe"
+        else:
+            severity = "moderate"
+
+        description = (row.get("Advisement") or "").strip()
+        location_name = (row.get("Location Name") or "").strip()
+
+        # Stable external_id: prefer the DOH event ID embedded in the
+        # advisement URL; fall back to a sha256 hash of (type, issuance,
+        # title) so re-fetches deduplicate cleanly.
+        ev_id = Sources._doh_extract_event_id(description)
+        if ev_id:
+            external_id = "id_" + ev_id
+        else:
+            ref = type_name + "|" + issuance_str + "|" + title
+            external_id = "h_" + hashlib.sha256(ref.encode("utf-8")).hexdigest()[:16]
+
+        # Friendly title: prepend the location when not already in the title,
+        # since the alert message uses this string directly.
+        friendly_title = title
+        if location_name and location_name not in title:
+            friendly_title = title + " (" + location_name + ")"
+
+        url_match = re.search(
+            r"https?://eha-cloud\.doh\.hawaii\.gov/cwb[/#!]+(?:event|viewer)[^\s\"]*",
+            description,
+        )
+        event_url = url_match.group(0) if url_match else None
+
+        return {
+            "source": "doh_cwb",
+            "external_id": external_id,
+            "hazard_type": hazard_type,
+            "severity": severity,
+            "severity_class": "warning",
+            "hazard_category": "water_quality",
+            "tier_level": "free",
+            "magnitude": None,
+            "title": friendly_title,
+            "description": description[:1500],
+            "url": event_url,
+            "occurred_at": occurred_at,
+            "geom_wkt": geom_wkt,
+            "raw": {"location_name": location_name, "island": island_field,
+                    "type": type_name},
+        }
+
+    @staticmethod
+    def _hawaii_polygon_for(island_field, statewide) -> Optional[str]:
+        """Return a POLYGON WKT for the given DOH Island field. Statewide
+        and missing-island fall back to the all-islands bounding box."""
+        if statewide or not island_field:
+            bbox = Sources.HAWAII_STATEWIDE_BBOX
+        else:
+            # Strip non-ASCII chars to handle smart-quote and Hawaiian okina
+            # characters that DOH uses in island names like "Kaua'i", "O'ahu".
+            normalized = "".join(c for c in island_field.lower() if ord(c) < 128).strip()
+            # Stripping the leading smart quote in "'ahu" leaves "ahu".
+            if normalized == "ahu":
+                normalized = "oahu"
+            bbox = Sources.HAWAII_ISLAND_BBOX.get(
+                normalized, Sources.HAWAII_STATEWIDE_BBOX
+            )
+        (lo_lng, lo_lat), (hi_lng, hi_lat) = bbox
+        return ("POLYGON((" + str(lo_lng) + " " + str(lo_lat) + ","
+                + str(hi_lng) + " " + str(lo_lat) + ","
+                + str(hi_lng) + " " + str(hi_lat) + ","
+                + str(lo_lng) + " " + str(hi_lat) + ","
+                + str(lo_lng) + " " + str(lo_lat) + "))")
+
+    @staticmethod
+    def _doh_extract_event_id(text) -> Optional[str]:
+        """Pull a DOH event id (e.g. '1930') from advisement text URLs."""
+        if not text:
+            return None
+        m = re.search(r"/event/(\d+)/", text)
+        if m:
+            return m.group(1)
+        m = re.search(r"eventId=(\d+)", text)
+        if m:
+            return m.group(1)
+        return None
+
     @staticmethod
     def all_sources() -> List[str]:
-        return ["usgs", "nws", "eonet", "gdacs"]
+        return ["usgs", "nws", "eonet", "gdacs", "doh"]
 
     @staticmethod
     def fetch(source: str) -> List[dict]:
@@ -1078,6 +1248,8 @@ class Sources:
             return Sources.fetch_eonet()
         if source == "gdacs":
             return Sources.fetch_gdacs()
+        if source == "doh":
+            return Sources.fetch_doh()
         return []
 
 
@@ -1095,10 +1267,12 @@ def upsert_events(conn, normalized: List[dict]) -> List[int]:
             c.execute("""
                 INSERT INTO ew_events (
                     source, external_id, hazard_type, severity, magnitude,
-                    title, description, url, occurred_at, raw_payload, geom
+                    title, description, url, occurred_at, raw_payload, geom,
+                    severity_class, hazard_category, tier_level
                 ) VALUES (
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb,
-                    ST_SetSRID(ST_GeomFromText(%s), 4326)::geography
+                    ST_SetSRID(ST_GeomFromText(%s), 4326)::geography,
+                    %s, %s, %s
                 )
                 ON CONFLICT (source, external_id) DO NOTHING
                 RETURNING id
@@ -1109,6 +1283,9 @@ def upsert_events(conn, normalized: List[dict]) -> List[int]:
                 ev.get("occurred_at"),
                 json_lib.dumps(ev.get("raw") or {}, default=str),
                 ev.get("geom_wkt"),
+                ev.get("severity_class"),
+                ev.get("hazard_category"),
+                ev.get("tier_level", "free"),
             ))
             row = c.fetchone()
             if row:
@@ -1221,7 +1398,7 @@ async def startup_event():
     print("Database initialized (EarthWatch v" + VERSION + ")")
     scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
     scheduler_thread.start()
-    print("Background scheduler started (12-hour check cycle: usgs + nws + eonet + gdacs)")
+    print("Background scheduler started (12-hour check cycle: usgs + nws + eonet + gdacs + doh)")
     threading.Thread(target=run_check_cycle, daemon=True).start()
     print("Initial EW check cycle started")
 
