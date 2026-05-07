@@ -35,7 +35,7 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@earthwatch.app")
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-VERSION = "0.1.9"
+VERSION = "0.1.10"
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
@@ -711,10 +711,11 @@ async def get_place_events(place_id: int, user_id: int = Depends(get_current_use
 
         static_map_url = build_static_map_url(place_lat, place_lng, place_radius, ev_pins)
 
-        # v0.1.9: nearby buoy readings (NDBC). Latest reading per ocean_site
-        # within the place radius. Same spatial-join model as events, but
-        # against ocean_sites/buoy_readings rather than ew_events. Empty list
-        # if no NDBC stations are within range.
+        # v0.1.9: nearby buoy readings (NDBC). Latest reading per ocean_site.
+        # v0.1.10: dropped the radius filter - watch radius is for advisory
+        # matching (DOH polygons), not buoy proximity. Surfers care about the
+        # nearest reading station regardless of their chosen watch zone.
+        # Always returns the 3 nearest active NDBC buoys with a recent reading.
         c.execute("""
             SELECT s.id, s.source_id, s.name, s.lat, s.lng,
                    ST_Distance(s.geom, p.geom) / 1609.344 AS distance_mi,
@@ -730,9 +731,8 @@ async def get_place_events(place_id: int, user_id: int = Depends(get_current_use
             ) r ON TRUE
             WHERE s.source = 'ndbc'
               AND s.active = TRUE
-              AND ST_DWithin(s.geom, p.geom, p.radius_mi * 1609.344)
             ORDER BY distance_mi ASC
-            LIMIT 10
+            LIMIT 3
         """, (place_id,))
 
         buoys = []
