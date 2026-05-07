@@ -35,7 +35,7 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@earthwatch.app")
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-VERSION = "0.1.10"
+VERSION = "0.1.11"
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
@@ -839,13 +839,31 @@ async def geocode_place(q: GeocodeQuery, user_id: int = Depends(get_current_user
     text = (q.query or "").strip()
     if len(text) < 2:
         raise HTTPException(status_code=400, detail="Query too short")
+    # v0.1.11: bounds bias + region + "Hawaii" prepend, replacing the v0.1.9
+    # strict components filter that broke informal place names. components=
+    # administrative_area:HI excluded "Pipeline", "Sunset Beach", and other
+    # surf-spot nicknames that Google does not tag with administrative_area,
+    # falling back to the state centroid on Big Island. Bounds is a bias hint
+    # (not exclusion); the "Hawaii" suffix gives Google a context signal that
+    # disambiguates "Turtle Bay Hawaii" -> Oahu (not Manhattan).
+    coord_parts = [p.strip() for p in text.split(",")]
+    is_coord = False
+    if len(coord_parts) == 2:
+        try:
+            float(coord_parts[0]); float(coord_parts[1])
+            is_coord = True
+        except (ValueError, TypeError):
+            pass
+    text_lower = text.lower()
+    already_hawaii = ("hawaii" in text_lower
+                      or ", hi" in text_lower
+                      or text_lower.endswith(" hi"))
+    search_text = text if (is_coord or already_hawaii) else (text + " Hawaii")
     try:
-        # v0.1.9: components=administrative_area:HI|country:US is Google's STRICT
-        # filter (not a bias hint) - any result outside Hawaii is excluded entirely.
-        # Fixes Turtle Bay -> Manhattan and similar globally-ambiguous beach names.
         url = ("https://maps.googleapis.com/maps/api/geocode/json?address="
-               + urllib.parse.quote(text)
-               + "&components=" + urllib.parse.quote("administrative_area:HI|country:US")
+               + urllib.parse.quote(search_text)
+               + "&bounds=" + urllib.parse.quote("18.85,-160.50|22.30,-154.75")
+               + "&region=us"
                + "&key=" + GOOGLE_GEOCODING_API_KEY)
         req = urllib.request.Request(url, headers={"User-Agent": "EarthWatch/0.1"})
         with urllib.request.urlopen(req, timeout=10) as resp:
