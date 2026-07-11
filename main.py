@@ -850,7 +850,7 @@ class GeocodeQuery(BaseModel):
 # v: public route — anon users must be able to geocode/preview a place before
 # signing up. Save is still the auth trigger. user_id was unused in the body.
 async def geocode_place(q: GeocodeQuery):
-    """Forward-geocode a free-text query via Google Places API findplacefromtext.
+    """Forward-geocode a free-text query via the Google Geocoding API.
     Returns up to 5 candidates so the user can pick the right match.
     Backend-side so the API key never lives in the frontend."""
     if not GOOGLE_GEOCODING_API_KEY:
@@ -858,11 +858,9 @@ async def geocode_place(q: GeocodeQuery):
     text = (q.query or "").strip()
     if len(text) < 2:
         raise HTTPException(status_code=400, detail="Query too short")
-    # v0.1.12: switched from Geocoding API to Places API findplacefromtext.
-    # Geocoding API is built for structured addresses; Places API is built for
-    # fuzzy informal-name matching. "Pipeline" -> Banzai Pipeline, "Sunset" ->
-    # Sunset Beach. locationbias=rectangle pulls Hawaii results to the top.
-    # Fixes the Pipeline/Sunset/Turtle-Bay-as-Hawaii-centroid failure mode.
+    # Note: an earlier build used the Places API (findplacefromtext) for fuzzy
+    # nickname matching, but the shared Google key isn't authorized for Places,
+    # so it's back on the Geocoding API (see free-text branch below).
     coord_parts = [p.strip() for p in text.split(",")]
     is_coord = False
     if len(coord_parts) == 2:
@@ -902,41 +900,38 @@ async def geocode_place(q: GeocodeQuery):
                 "place_id": r.get("place_id", ""),
             })
         return {"candidates": out}
-    # Free-text query: Places API findplacefromtext with Hawaii location bias.
+    # Free-text query: Geocoding API (geocode/json). Switched OFF the Places API
+    # findplacefromtext call — the shared Google key isn't authorized for the
+    # Places API, so it returned REQUEST_DENIED here while Earth/Pivot (which use
+    # the Geocoding API on the same key) worked fine. bounds= biases results
+    # toward Hawaii without hard-restricting (loses some fuzzy nickname matching).
     try:
-        url = ("https://maps.googleapis.com/maps/api/place/findplacefromtext/json"
-               "?input=" + urllib.parse.quote(text)
-               + "&inputtype=textquery"
-               + "&locationbias=" + urllib.parse.quote("rectangle:18.85,-160.50|22.30,-154.75")
-               + "&fields=" + urllib.parse.quote("formatted_address,geometry,name,place_id")
+        url = ("https://maps.googleapis.com/maps/api/geocode/json?address="
+               + urllib.parse.quote(text)
+               + "&bounds=" + urllib.parse.quote("18.85,-160.50|22.30,-154.75")
                + "&key=" + GOOGLE_GEOCODING_API_KEY)
         req = urllib.request.Request(url, headers={"User-Agent": "EarthWatch/0.1"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json_lib.loads(resp.read().decode("utf-8", errors="replace"))
     except Exception as e:
-        print("[geocode places] " + str(e))
+        print("[geocode] " + str(e))
         raise HTTPException(status_code=502, detail="Geocoding lookup failed")
     status = data.get("status")
     if status == "ZERO_RESULTS":
         return {"candidates": []}
     if status != "OK":
-        print("[geocode places] status=" + str(status) + " for query: " + text
+        print("[geocode] status=" + str(status) + " for query: " + text
               + " (error_message=" + str(data.get("error_message", ""))[:200] + ")")
         raise HTTPException(status_code=502, detail="Geocoding lookup failed")
     candidates = []
-    for r in (data.get("candidates") or [])[:5]:
+    for r in (data.get("results") or [])[:5]:
         loc = ((r.get("geometry") or {}).get("location")) or {}
         lat = loc.get("lat")
         lng = loc.get("lng")
         if lat is None or lng is None:
             continue
-        # Places API gives us a richer "name" field separate from formatted_address.
-        # Format as "Name, Address" so users see the place name first.
-        name = r.get("name", "")
-        addr = r.get("formatted_address", "")
-        display = (name + ", " + addr) if (name and addr and name.lower() not in addr.lower()) else (name or addr)
         candidates.append({
-            "formatted_address": display,
+            "formatted_address": r.get("formatted_address", ""),
             "lat": float(lat),
             "lng": float(lng),
             "place_id": r.get("place_id", ""),
